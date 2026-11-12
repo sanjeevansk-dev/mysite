@@ -25,7 +25,7 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-BRAND = "Nimbus"
+BRAND = "Sanjeevan"
 PORT = int(os.environ.get("PORT", 8000))
 HOST = "0.0.0.0" if "PORT" in os.environ else "localhost"
 DB_FILE = os.environ.get(
