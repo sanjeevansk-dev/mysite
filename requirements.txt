@@ -1,3 +1,4 @@
 # No extra packages needed - app.py uses only the Python standard library.
-   sqlalchemy
-   psycopg2-binary
+sqlalchemy
+psycopg2-binary
+psycopg[binary]
