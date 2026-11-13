@@ -12,20 +12,15 @@ Features
   - Security: PBKDF2 password hashing, CSRF tokens, login rate-limiting,
     HttpOnly + SameSite cookies, session expiry, security headers
 """
-import os
-from sqlalchemy import create_engine, text
-
-url = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
-engine = create_engine(url, pool_pre_ping=True)
-
 import hashlib
 import hmac
 import html
 import os
 import re
 import secrets
-import sqlite3
 import time
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timezone
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -48,28 +43,35 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ------------------------------------------------------------------ database
-def db():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
+# Uses Postgres when DATABASE_URL is set (Render); falls back to a local
+# SQLite file so `python app.py` still works on your own computer.
+_url = os.environ.get("DATABASE_URL", "").strip()
+if _url:
+    for _prefix in ("postgres://", "postgresql://"):
+        if _url.startswith(_prefix):
+            _url = "postgresql+psycopg://" + _url[len(_prefix):]
+            break
+else:
+    _url = "sqlite:///" + DB_FILE
+engine = create_engine(_url, pool_pre_ping=True)
+IS_PG = engine.dialect.name == "postgresql"
 
 
 def init_db():
-    with db() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS users (
-                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pk = "SERIAL PRIMARY KEY" if IS_PG else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    blob = "BYTEA" if IS_PG else "BLOB"
+    with engine.begin() as conn:
+        conn.execute(text(
+            f"""CREATE TABLE IF NOT EXISTS users (
+                   id {pk},
                    username TEXT UNIQUE NOT NULL,
                    email TEXT UNIQUE NOT NULL,
-                   salt BLOB NOT NULL,
-                   password_hash BLOB NOT NULL
+                   salt {blob} NOT NULL,
+                   password_hash {blob} NOT NULL,
+                   fullname TEXT DEFAULT '',
+                   created_at TEXT DEFAULT ''
                )"""
-        )
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)")}
-        if "fullname" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN fullname TEXT DEFAULT ''")
-        if "created_at" not in cols:
-            conn.execute("ALTER TABLE users ADD COLUMN created_at TEXT DEFAULT ''")
+        ))
 
 
 def hash_password(password, salt):
@@ -356,8 +358,9 @@ class Handler(BaseHTTPRequestHandler):
         if not s or s["exp"] < time.time():
             SESSIONS.pop(token, None)
             return None
-        with db() as conn:
-            return conn.execute("SELECT * FROM users WHERE id=?", (s["uid"],)).fetchone()
+        with engine.connect() as conn:
+            return conn.execute(text("SELECT * FROM users WHERE id=:id"),
+                                {"id": s["uid"]}).mappings().first()
 
     def csrf_token(self):
         """Return (token, is_new). Token lives in a cookie and in a hidden form field."""
@@ -463,14 +466,15 @@ class Handler(BaseHTTPRequestHandler):
             return fail("You must accept the Terms of Service.")
         salt = os.urandom(16)
         try:
-            with db() as conn:
+            with engine.begin() as conn:
                 conn.execute(
-                    "INSERT INTO users (username,email,salt,password_hash,fullname,created_at) "
-                    "VALUES (?,?,?,?,?,?)",
-                    (vals["username"], vals["email"].lower(), salt,
-                     hash_password(password, salt), vals["fullname"][:60], now_iso()),
+                    text("INSERT INTO users (username,email,salt,password_hash,fullname,created_at) "
+                         "VALUES (:u,:e,:s,:p,:f,:c)"),
+                    {"u": vals["username"], "e": vals["email"].lower(), "s": salt,
+                     "p": hash_password(password, salt), "f": vals["fullname"][:60],
+                     "c": now_iso()},
                 )
-        except sqlite3.IntegrityError:
+        except IntegrityError:
             return fail("That username or email is already registered.")
         self.redirect("/login?registered=1")
 
@@ -483,12 +487,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_html(login_page(csrf[0], error="Too many failed attempts. "
                                              "Please wait a few minutes and try again.", login=login),
                                   429, csrf=csrf)
-        with db() as conn:
-            row = conn.execute("SELECT * FROM users WHERE username=? OR email=?",
-                               (login, login.lower())).fetchone()
-        salt = row["salt"] if row else b"\x00" * 16          # same work either way
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT * FROM users WHERE username=:u OR email=:e"),
+                               {"u": login, "e": login.lower()}).mappings().first()
+        salt = bytes(row["salt"]) if row else b"\x00" * 16   # same work either way
         digest = hash_password(password, salt)
-        if not row or not hmac.compare_digest(digest, row["password_hash"]):
+        if not row or not hmac.compare_digest(digest, bytes(row["password_hash"])):
             ATTEMPTS[key].append(time.time())
             return self.send_html(login_page(csrf[0], error="Incorrect username/email or password.",
                                              login=login), 401, csrf=csrf)
