@@ -15,10 +15,14 @@ Features
 import hashlib
 import hmac
 import html
+import ipaddress
+import json
 import os
 import re
 import secrets
+import threading
 import time
+import urllib.request
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 from datetime import datetime, timezone
@@ -72,6 +76,50 @@ def init_db():
                    created_at TEXT DEFAULT ''
                )"""
         ))
+        conn.execute(text(
+            f"""CREATE TABLE IF NOT EXISTS login_events (
+                   id {pk},
+                   username TEXT NOT NULL,
+                   event TEXT NOT NULL,
+                   ip TEXT DEFAULT '',
+                   city TEXT DEFAULT '',
+                   region TEXT DEFAULT '',
+                   country TEXT DEFAULT '',
+                   created_at TEXT DEFAULT ''
+               )"""
+        ))
+
+
+def lookup_geo(ip):
+    """Approximate (city, region, country) for a public IP; blanks if unavailable."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+            return "", "", ""
+        with urllib.request.urlopen(f"https://ipwho.is/{addr}", timeout=3) as r:
+            d = json.loads(r.read().decode())
+        if d.get("success"):
+            return d.get("city") or "", d.get("region") or "", d.get("country") or ""
+    except Exception as e:
+        print("geo lookup failed:", e)
+    return "", "", ""
+
+
+def record_event(username, event, ip):
+    """Save IP + location in the background so the page never waits for the lookup."""
+    def work():
+        city, region, country = lookup_geo(ip)
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("INSERT INTO login_events (username,event,ip,city,region,country,created_at) "
+                         "VALUES (:u,:ev,:ip,:ci,:re,:co,:c)"),
+                    {"u": username, "ev": event, "ip": (ip or "")[:45], "ci": city,
+                     "re": region, "co": country, "c": now_iso()},
+                )
+        except Exception as e:
+            print("login_events insert failed:", e)
+    threading.Thread(target=work, daemon=True).start()
 
 
 def hash_password(password, salt):
@@ -346,6 +394,12 @@ class Handler(BaseHTTPRequestHandler):
         return jar[name].value if name in jar else None
 
     def client_ip(self):
+        # Render sits behind Cloudflare, which sets True-Client-IP (cannot be faked
+        # by visitors). X-Forwarded-For is only a fallback because it can be spoofed.
+        for h in ("True-Client-IP", "CF-Connecting-IP"):
+            v = (self.headers.get(h) or "").strip()
+            if v:
+                return v
         fwd = self.headers.get("X-Forwarded-For")
         return fwd.split(",")[0].strip() if fwd else self.client_address[0]
 
@@ -476,6 +530,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
         except IntegrityError:
             return fail("That username or email is already registered.")
+        record_event(vals["username"], "register", self.client_ip())
         self.redirect("/login?registered=1")
 
     def do_login(self, f, csrf):
@@ -497,6 +552,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_html(login_page(csrf[0], error="Incorrect username/email or password.",
                                              login=login), 401, csrf=csrf)
         ATTEMPTS.pop(key, None)
+        record_event(row["username"], "login", self.client_ip())
         ttl = LONG_SESSION if f.get("remember") else SHORT_SESSION
         token = secrets.token_urlsafe(32)
         SESSIONS[token] = {"uid": row["id"], "exp": time.time() + ttl}
