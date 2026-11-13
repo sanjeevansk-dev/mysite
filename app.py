@@ -90,18 +90,42 @@ def init_db():
         ))
 
 
+def _fetch_json(url):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; SanjeevanSite/1.0)",
+        "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=4) as r:
+        return json.loads(r.read().decode())
+
+
 def lookup_geo(ip):
-    """Approximate (city, region, country) for a public IP; blanks if unavailable."""
+    """Approximate (city, region, country) for a public IP; blanks if unavailable.
+    Tries several free services in turn and logs why each one failed."""
     try:
         addr = ipaddress.ip_address(ip)
-        if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
-            return "", "", ""
-        with urllib.request.urlopen(f"https://ipwho.is/{addr}", timeout=3) as r:
-            d = json.loads(r.read().decode())
-        if d.get("success"):
-            return d.get("city") or "", d.get("region") or "", d.get("country") or ""
-    except Exception as e:
-        print("geo lookup failed:", e)
+    except ValueError:
+        print("geo skipped: not a valid IP:", repr(ip))
+        return "", "", ""
+    if addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_link_local:
+        print("geo skipped: private/local IP", addr)
+        return "", "", ""
+    providers = (
+        (f"https://ipwho.is/{addr}",
+         lambda d: (d.get("city"), d.get("region"), d.get("country")) if d.get("success") else None),
+        (f"https://ipapi.co/{addr}/json/",
+         lambda d: (d.get("city"), d.get("region"), d.get("country_name")) if not d.get("error") else None),
+        (f"http://ip-api.com/json/{addr}?fields=status,country,regionName,city",
+         lambda d: (d.get("city"), d.get("regionName"), d.get("country")) if d.get("status") == "success" else None),
+    )
+    for url, pick in providers:
+        try:
+            d = _fetch_json(url)
+            got = pick(d)
+            if got and any(got):
+                return tuple(x or "" for x in got)
+            print("geo no result from", url.split("/")[2], str(d)[:150])
+        except Exception as e:
+            print("geo lookup failed:", url.split("/")[2], e)
     return "", "", ""
 
 
