@@ -12,6 +12,12 @@ Features
   - Security: PBKDF2 password hashing, CSRF tokens, login rate-limiting,
     HttpOnly + SameSite cookies, session expiry, security headers
 """
+import os
+from sqlalchemy import create_engine, text
+
+url = os.environ["DATABASE_URL"].replace("postgres://", "postgresql://", 1)
+engine = create_engine(url, pool_pre_ping=True)
+
 import hashlib
 import hmac
 import html
